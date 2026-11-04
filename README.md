@@ -57,6 +57,6 @@ does not watch for hot-plug. Reload it after you plug a card in.
 ## Notes
 
 - The module needs `debugfs` mounted at `/sys/kernel/debug`, which is the default.
-- Each read sends one mailbox command and waits up to about 240 ms for the answer, so do not
+- Each read sends one mailbox command and waits up to about one second for the answer, so do not
   poll the file many times per second.
-- Tested on Arch Linux with kernel 6.x and 7.x.
+- Written for and used on Arch Linux. The module uses `usb_control_msg_send` and `_recv`, so it needs kernel 5.10 or newer.
