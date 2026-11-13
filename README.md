@@ -1,62 +1,78 @@
-# gc571sig
+# AVerMedia GC550 (Live Gamer Extreme) Linux + OBS Setup
 
-A small Linux kernel module that reads the HDMI input signal of an AVerMedia GC571 (Live Gamer
-Ultra 2.1, USB `07ca:0571`) and reports it in debugfs:
+This branch packages the complete setup and OBS fix for running the **AVerMedia GC550 (`07ca:4710`)** on Linux stream PCs while keeping the card **100% safe for the official Windows driver**.
 
-```
-$ sudo cat /sys/kernel/debug/gc571sig/<serial>
-1920x1080 @ 60.00 Hz  Htotal=2200 Vtotal=1125  checksum=ok
-```
+## 1. Driver Repository (`lgx2d`)
 
-or `no signal`. One file per card, named by the card's USB serial number.
+The guarded C++ userspace driver lives in [`Hong-Kong-Otoge-Club/lgx2userspace` (branch `gc550`)](https://github.com/Hong-Kong-Otoge-Club/lgx2userspace/tree/gc550):
+- **`Gc550Policy` fail-closed filter**: Blocks all `AT88SC` CryptoMemory opcodes (`05/06/07/09/B8/BA`), board flash writes (`0D/15`), and CDCE913 EEPROM/lock register writes so the anti-clone chip counter is never touched and **the card continues to work on Windows**.
+- **Zero-copy 1080p60 pipeline**: Uses `memchr` in-place marker scanning and a 32-slot ring buffer, writing `1920x1080` `YUYV` frames into a `v4l2loopback` device (`/dev/video10`) and publishing audio to PipeWire (`LGX2 Audio`).
 
-## Why
+## 2. Quick Install on Another Linux PC
 
-The GC571 is a UVC device, so `uvcvideo` streams video from it without a vendor driver. The
-input signal timing is not in the UVC stream. The card exposes it through a vendor command
-mailbox on UVC Extension Unit 4 of the VideoControl interface. `uvcvideo` does not register
-that extension unit, because it hangs off the Output Terminal and the chain scanner drops it.
+Run [`install-gc550.sh`](./install-gc550.sh) on the target Linux PC:
 
-This module talks to endpoint 0 directly. It claims no interface and changes nothing in
-`uvcvideo`, so it is safe to use while the card streams.
-
-## Mailbox protocol
-
-Reverse engineered from the vendor's Windows tool.
-
-- Selector 1 is the command and response buffer, variable length.
-- Selector 2 is a 16-bit register. SET resizes selector 1. GET reports the pending response length.
-- To read register R: SET_CUR(selector 2) = 9, SET_CUR(selector 1) = the 9-byte command frame,
-  poll GET_CUR(selector 2) until it reports a length L, then GET_CUR(selector 1) for L bytes.
-- Command frame: `[toggle] 06 00 00 [reg] 00 00 00 [checksum]`. The toggle byte must differ from
-  the previous command or the device ignores it. The response echoes the toggle. The checksum
-  makes the whole frame sum to 0 modulo 256.
-- Register `0x37` holds the raw HDMI timing block: Vtotal, Htotal, height, width and the refresh
-  rate in 0.01 Hz, each 16-bit little endian.
-
-Only register `0x37` is read. The module sends no other command.
-
-## Install
-
-Build and load once, for the running kernel:
-
-```
-make
-sudo insmod gc571sig.ko
+```bash
+chmod +x install-gc550.sh
+./install-gc550.sh
 ```
 
-Or install with DKMS so it rebuilds on every kernel update and loads at boot. `install.sh` does
-that on Arch Linux: it installs `dkms` with pacman, stages the source under `/usr/src`, runs
-`dkms add`, `build` and `install`, writes `/etc/modules-load.d/gc571sig.conf` and loads the
-module. On other distributions, run the same `dkms` commands after you install `dkms` and the
-kernel headers.
+What it does:
+1. Installs dependencies (`g++`, `pkg-config`, `libusb-1.0-0-dev`, `libpipewire-0.3-dev`, `v4l2loopback-dkms`).
+2. Clones [`Hong-Kong-Otoge-Club/lgx2userspace` (`gc550` branch)](https://github.com/Hong-Kong-Otoge-Club/lgx2userspace/tree/gc550) and runs `scripts/build-gc550.sh`.
+3. Installs `/etc/udev/rules.d/70-avermedia-gc550.rules` (`07ca:4710`) and `/etc/modprobe.d/v4l2loopback.conf` (`video_nr=10 card_label="gc550" exclusive_caps=0`).
+4. Installs and enables `~/.config/systemd/user/gc550.service` (`lgx2d -x -d /dev/video10`).
 
-Plug the cards in before you load the module. It finds the cards at load time, up to 8, and
-does not watch for hot-plug. Reload it after you plug a card in.
+---
 
-## Notes
+## 3. Fixing the OBS Black Screen (`v4l2-helpers: unable to start stream`)
 
-- The module needs `debugfs` mounted at `/sys/kernel/debug`, which is the default.
-- Each read sends one mailbox command and waits up to about one second for the answer, so do not
-  poll the file many times per second.
-- Written for and used on Arch Linux. The module uses `usb_control_msg_send` and `_recv`, so it needs kernel 5.10 or newer.
+### Why OBS fails when configured via the OBS GUI
+When you open the properties of a **Video Capture Device (V4L2)** (`v4l2_input`) in the OBS GUI, OBS writes explicit `"resolution"` (e.g. `8246337209400` for `1920x1080`) and `"framerate"` (`-1` or packed fraction) keys into the source settings.
+
+When OBS opens `/dev/video10` with those keys present, it calls `VIDIOC_S_FMT` and `VIDIOC_S_PARM` to renegotiate the V4L2 format. Because `lgx2d` is **already actively writing frames** to `/dev/video10`, `v4l2loopback` returns `EBUSY`, and OBS fails with:
+```text
+error: v4l2-helpers: unable to start stream
+```
+
+### How to fix it
+Do **not** include `"resolution"` or `"framerate"` in the OBS `v4l2_input` source settings for `/dev/video10`. Only pass:
+
+```json
+{
+    "device_id": "/dev/video10",
+    "input": 0,
+    "pixelformat": 1448695129,
+    "buffering": false
+}
+```
+*(where `1448695129` is FourCC `YUYV`).*
+
+When `"resolution"` and `"framerate"` are omitted:
+- OBS skips `VIDIOC_S_FMT` / `VIDIOC_S_PARM` renegotiation.
+- OBS immediately adopts the active `1920x1080 YUYV` format from `lgx2d` and starts streaming without error.
+
+### Automated Fix Script
+- **Offline (while OBS is closed):**
+  ```bash
+  python3 fix-obs-gc550.py --device /dev/video10 \
+    --scene-json ~/.var/app/com.obsproject.Studio/config/obs-studio/basic/scenes/Untitled.json
+  ```
+- **Live via `obs-websocket` (in Python layout builder scripts):**
+  ```python
+  import struct
+  YUYV = struct.unpack("<I", b"YUYV")[0]
+
+  obs.req("CreateInput", {
+      "sceneName": "Main",
+      "inputName": "1P Capture",
+      "inputKind": "v4l2_input",
+      "inputSettings": {
+          "device_id": "/dev/video10",
+          "input": 0,
+          "pixelformat": YUYV,
+          "buffering": False,
+      },
+      "sceneItemEnabled": True,
+  })
+  ```
